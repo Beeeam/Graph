@@ -1,0 +1,12 @@
+slurm_result/
+__pycache__/
+.ipynb_checkpoints
+.DS_Store
+ckpt/
+runs/
+logs/
+experiments/
+finetune/
+study
+*.log
+

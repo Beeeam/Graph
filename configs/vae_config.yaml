@@ -1,0 +1,40 @@
+batch_size: 512                  # batch size
+epochs: 200                     # total number of epochs
+eval_every_n_epochs: 1          # validation frequency
+# fine_tune_from: pretrained_gin  # sub directory of pre-trained model in ./ckpt
+log_every_n_steps: 20           # print training log frequency
+init_decoder_lr: 0.001   #0.0001    # initial learning rate for the prediction head
+init_encoder_lr: 0.001   #0.00008   # initial learning rate for the base GNN encoder
+weight_decay: 0.0001 #0.01              # weight decay of Adam
+optimizer: adamw                 # optimizer
+scheduler: cosine               # learning rate scheduler
+warmup_ratio: 0.05
+random_seed: 42
+finetune_flag: True
+grad_clip: 5
+
+max_length: 128
+pretrained_model: MRCD                 # GNN backbone (i.e., gin/gcn)
+decoder:
+  latent_dim: 300
+  embed_dim: 128
+  dim_feedforward: 512
+  nhead: 4
+  num_layers: 2
+
+kl_anneal:
+  kl_start: 0
+  kl_end: 1
+  kl_anneal_epochs: 10
+  mode: cyclical
+
+dataset:
+  
+  num_workers: 0                # dataloader number of workers
+  valid_size: 0.1               # ratio of validation data
+  test_size: 0.1                # ratio of test data
+  splitting: random           # data splitting (i.e., random/scaffold)
+
+vocab_path: '/Users/bmw/Research/data/vae/pubchem_vocab.pkl'
+h5_path: '/Users/bmw/Research/data/vae/pubchem.h5'
+data_path: '/Users/bmw/Research/data/data/pubchem-10m-clean.txt'
