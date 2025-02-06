@@ -11,11 +11,11 @@ import torch
 from torch import nn
 from torch.optim import AdamW, Adam, SGD
 from torch.nn.utils import clip_grad_norm_
-import torch.nn.functional as F
+
 from torch.utils.tensorboard import SummaryWriter
 
 from transformers import get_scheduler
-from utils import vae_loss, build_vocab_large, load_vocab_from_pickle, KLAnnealer
+from utils import vae_loss, load_vocab_from_pickle, KLAnnealer
 from data import MoleculeLoaderWrapper
 from vae import GraphEncoder, SMILESDecoder, VAE
 
@@ -176,7 +176,7 @@ class VAE_trainer(object):
             )
 
             if epoch % self.config['eval_every_n_epochs'] == 0:
-                valid_loss = self._evaluate(model, valid_loader)
+                valid_loss = self._evaluate(model, valid_loader, kl_weight)
                 self.writer.add_scalar('valid_loss', valid_loss, global_step=valid_n_iter)
                 valid_n_iter += 1
 
@@ -187,7 +187,7 @@ class VAE_trainer(object):
             
             # self._test(model, test_loader)
 
-    def _evaluate(self, model, loader):
+    def _evaluate(self, model, loader, kl_weight):
         model.eval()
         total_loss = 0
         batch_idx = 0
@@ -199,7 +199,7 @@ class VAE_trainer(object):
                 fgp = fgp.to(self.device)
 
                 recon_loss, kl_loss = self._step(model, data, seq, fgp)
-                loss = recon_loss + self.config['kl_weight'] * kl_loss
+                loss = recon_loss + kl_weight * kl_loss
 
                 total_loss += loss.item()
                 batch_idx += 1
