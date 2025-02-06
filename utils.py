@@ -363,6 +363,7 @@ def preprocess_to_h5(data_path, vocab, h5_path, max_seq_len=128, fpSize=2048):
         skipped = 0
         with open(data_path, 'r') as csv_file:
             csv_reader = csv.reader(csv_file)
+            
             idx = 0
             for row in tqdm(csv_reader, desc="Preprocessing"):
                 smi = row[-1]

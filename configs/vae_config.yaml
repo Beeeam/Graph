@@ -29,11 +29,12 @@ kl_anneal:
   mode: cyclical
 
 dataset:
-  
   num_workers: 0                # dataloader number of workers
   valid_size: 0.1               # ratio of validation data
   test_size: 0.1                # ratio of test data
   splitting: random           # data splitting (i.e., random/scaffold)
+  max_seq_length: 128
+  fpSize: 2048
 
 vocab_path: '/Users/bmw/Research/data/vae/pubchem_vocab.pkl'
 h5_path: '/Users/bmw/Research/data/vae/pubchem.h5'

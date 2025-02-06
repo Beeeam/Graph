@@ -223,7 +223,7 @@ def main(config):
     print('Loading vocab ...')
     vocab = load_vocab_from_pickle(config['vocab_path'])
     print('The size of vocab:', len(vocab))
-    dataset = MoleculeLoaderWrapper(h5_path = config['h5_path'], vocab = vocab, batch_size = config['batch_size'], **config['dataset'])
+    dataset = MoleculeLoaderWrapper(data_path = config['data_path'], vocab = vocab, batch_size = config['batch_size'], **config['dataset'])
     trainer = VAE_trainer(config = config, dataset=dataset, vocab=vocab)
     trainer.train()
 

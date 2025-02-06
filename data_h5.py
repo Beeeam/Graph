@@ -22,7 +22,7 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.data import Batch, Data, Dataset
 
 
-from utils import molecule_to_graph, calculate_ECFP
+from utils import molecule_to_graph
 
 """Adapted from:https://github.com/yuyangw/MolCLR/blob/master/dataset/dataset_test.py"""
 
@@ -54,33 +54,38 @@ def read_smiles(data_path):
             smiles_data.append(smiles)
     return smiles_data
 
-class MoleculeDataset(Dataset):
-    def __init__(self, data_path, vocab, max_seq_len, fpSize):
-        super(MoleculeDataset, self).__init__()
-        self.smiles_data = read_smiles(data_path)
+class MoleculeDataset_h5(Dataset):
+    def __init__(self, h5_path, vocab):
+        super(MoleculeDataset_h5, self).__init__()
+        self.h5 = h5py.File(h5_path, 'r')['data']
         self.vocab = vocab
-        self.max_seq_len = max_seq_len
-        self.fpSize = fpSize
-
+        self.length = self.h5['seq'].shape[0]
 
     def __getitem__(self, idx):
-        smi = self.smiles_data[idx]
-        mol = Chem.MolFromSmiles(smi)
 
-        if mol is None:
-            raise ValueError(f"wrong SMILES: {smi}")
-        data = molecule_to_graph(mol)  
+        x = self.h5['x'][idx]          # shape: (num_nodes * 2,)
+        edge_index = self.h5['edge_index'][idx]  # shape: (2 * num_edges,)
+        edge_attr = self.h5['edge_attr'][idx]    # shape: (num_edges * 2,)
 
-        seq = self.vocab.encode(smi, max_length=self.max_seq_len, padding=True)
-        seq_tensor = torch.tensor(seq, dtype=torch.long)
+        num_nodes = len(x) // 2
+        num_edges = len(edge_index) // 2
 
-        fgp = calculate_ECFP(mol,fpSize=self.fpSize)
-        fgp_tensor = torch.tensor(fgp, dtype=torch.long)
+        data = Data(
+            x=torch.tensor(x).view(num_nodes, 2).long(), 
+            edge_index=torch.tensor(edge_index).view(2, num_edges).long(),
+            edge_attr=torch.tensor(edge_attr).view(num_edges, 2).long()
+        )
 
-        return data, seq_tensor, fgp_tensor
+        seq_np = self.h5['seq'][idx]
+        seq = torch.from_numpy(seq_np).long()
+
+        fgp_np = self.h5['fgp'][idx]
+        fgp = torch.from_numpy(fgp_np).long()
+
+        return data, seq, fgp
 
     def __len__(self):
-        return len(self.smiles_data)
+        return self.length
 
 def _generate_scaffold(smiles, include_chirality=False):
     mol = Chem.MolFromSmiles(smiles)
@@ -136,11 +141,11 @@ def scaffold_split(dataset, valid_size, test_size, seed=None, log_every_n=1000):
 class MoleculeLoaderWrapper(object):
     
     def __init__(self, 
-        batch_size, data_path, num_workers, valid_size, test_size, 
+        batch_size, h5_path, num_workers, valid_size, test_size, 
          vocab, splitting, max_seq_length = 128, fpSize = 2048, seed = None
     ):
         super(object, self).__init__()
-        self.data_path = data_path
+        self.h5_path = h5_path
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.valid_size = valid_size
@@ -154,7 +159,7 @@ class MoleculeLoaderWrapper(object):
         assert splitting in ['random', 'scaffold']
 
     def get_data_loaders(self):
-        train_dataset = MoleculeDataset(data_path=self.data_path, vocab=self.vocab, max_seq_len=self.max_seq_length, fpSize=self.fpSize)
+        train_dataset = MoleculeDataset_h5(h5_path=self.h5_path, vocab=self.vocab)
         train_loader, valid_loader, test_loader = self.get_train_validation_data_loaders(train_dataset)
         return train_loader, valid_loader, test_loader
 
