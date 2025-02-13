@@ -89,18 +89,17 @@ class KLAnnealer:
         self.kl_end = config['kl_anneal']['kl_end']
         self.kl_anneal_epochs = config['kl_anneal']['kl_anneal_epochs']
         self.mode = config['kl_anneal']['mode']
-        self.cycles = 10
+        self.cycles = 5
 
     def get_kl_weight(self, epoch):
         if epoch >= self.kl_anneal_epochs:
             return self.kl_end
+        
         if self.mode in ['linear', 'sigmoid', 'exp', 'cosine']:
-            # Monotonic annealing
-
             y = epoch / self.kl_anneal_epochs
         elif self.mode == 'cyclical':
             # Cyclical annealing
-            cycle_length = self.kl_anneal_epochs // self.cycles
+            cycle_length = max(self.kl_anneal_epochs // self.cycles,1)
             epoch_in_cycle = epoch % cycle_length
             y = epoch_in_cycle / cycle_length
         else:
@@ -115,7 +114,7 @@ class KLAnnealer:
                 return self.kl_end * y
             return self.kl_start * ((self.kl_end / self.kl_start) ** y)  # Exponential
         elif self.mode == 'cosine':
-            slop = 0.5 * (1 + np.cos(np.pi * (1-y)))
+            slop = 0.5 * (1 - math.cos(math.pi * y))
             return self.kl_start + (self.kl_end - self.kl_start) * slop
         elif self.mode == 'cyclical':
             return self.kl_start + (self.kl_end - self.kl_start) * y

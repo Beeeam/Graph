@@ -13,6 +13,7 @@ from data import MoleculeLoaderWrapper
 from utils import vae_loss, load_vocab_from_pickle
 from vae import GraphEncoder, SMILESDecoder, VAE
 
+
 DEVICE = torch.device("cpu")
 if torch.cuda.is_available():
     DEVICE = torch.device("cuda")
@@ -158,3 +159,4 @@ if __name__ == '__main__':
     print(config)
     smiles = main(config)
     # print(smiles)
+

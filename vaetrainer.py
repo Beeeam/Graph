@@ -11,9 +11,9 @@ import torch
 from torch import nn
 from torch.optim import AdamW, Adam, SGD
 from torch.nn.utils import clip_grad_norm_
-
 from torch.utils.tensorboard import SummaryWriter
 
+from rdkit import Chem
 from transformers import get_scheduler
 from utils import vae_loss, load_vocab_from_pickle, KLAnnealer
 from data import MoleculeLoaderWrapper
@@ -52,28 +52,28 @@ class VAE_trainer(object):
             from models.gin import GINet
             graphmodel = GINet(num_layer=5, emb_dim=300, drop_ratio=0.3, pool='mean')
             checkpoints_folder = './models/ckpt/pretrained_gin/'
-            state_dict = torch.load(os.path.join(checkpoints_folder, 'model.pth'), map_location=DEVICE, weights_only=True)
+            state_dict = torch.load(os.path.join(checkpoints_folder, 'model.pth'), map_location=self.device, weights_only=True)
             graphmodel.load_my_state_dict(state_dict)
         elif self.config['pretrained_model'] == 'MoleBERT':
             from models.model import GNN
             graphmodel = GNN(num_layer=5,emb_dim=300, drop_ratio=0.5, JK='last', gnn_type='gin')
             checkpoints = './models/ckpt/Mole-BERT.pth'
-            state_dict = torch.load(checkpoints, map_location=DEVICE, weights_only=True)
+            state_dict = torch.load(checkpoints, map_location=self.device, weights_only=True)
             graphmodel.load_state_dict(state_dict)
         elif self.config['pretrained_model'] == 'MGSSL':
             from models.model import GNN
             graphmodel = GNN(num_layer=5, emb_dim=300, drop_ratio=0.5, JK='last', gnn_type='gin')
             checkpoints = './models/ckpt/MGSSL.pth'
-            state_dict = torch.load(checkpoints, map_location=DEVICE, weights_only=True)
+            state_dict = torch.load(checkpoints, map_location=self.device, weights_only=True)
             graphmodel.load_state_dict(state_dict)
         elif self.config['pretrained_model'] == 'MRCD':
             state_dict_path = './models/ckpt/CLR_model_MolCLR.pth'
-            CLRmodel = torch.load(state_dict_path, map_location=DEVICE, weights_only=False)
+            CLRmodel = torch.load(state_dict_path, map_location=self.device, weights_only=False)
             graphmodel = CLRmodel.graphmodel
         else:
             raise ValueError(f"No pretrainedmodel: {self.config['pretrained_model']}")
        
-        encoder = GraphEncoder(graphmodel, finetune=self.config['finetune_flag'])
+        encoder = GraphEncoder(graphmodel, latent_dim = self.config['decoder']['latent_dim'],finetune=self.config['finetune_flag'])
         decoder = SMILESDecoder(vocab=self.vocab, max_length=self.config['max_length'], **self.config['decoder'])
         vae = VAE(encoder=encoder, decoder=decoder)
         return vae
@@ -172,21 +172,42 @@ class VAE_trainer(object):
                 batch_idx += 1
 
             print(
-                f"Epoch [{epoch+1}/{self.config['epochs']}], Recon_loss:{tot_recon_loss/(batch_idx):.4f}, KL_loss:{tot_kl_loss/(batch_idx):.4f}, Loss: {tot_epoch_loss/(batch_idx):.4f}"
+                f"Epoch [{epoch+1}/{self.config['epochs']}], Recon_loss:{tot_recon_loss/(batch_idx):.4f}, KL_loss:{tot_kl_loss/(batch_idx):.4f}, Beta:{kl_weight}, Loss: {tot_epoch_loss/(batch_idx):.4f}"
             )
 
             if epoch % self.config['eval_every_n_epochs'] == 0:
-                valid_loss = self._evaluate(model, valid_loader, kl_weight)
-                self.writer.add_scalar('valid_loss', valid_loss, global_step=valid_n_iter)
-                valid_n_iter += 1
+                profile = self._evaluate_generation(model)
+                print(f"Epoch [{epoch+1}/{self.config['epochs']}], Validity: {profile['validity']:.4f}, Uniqueness: {profile['uniqueness']:.4f}")
 
-                if valid_loss < best_valid_loss:
-                    best_valid_loss = valid_loss
-                    torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'best_model.pth'))
-                    print(f'model saved with valid loss: {valid_loss}')
+            valid_loss = self._evaluate(model, valid_loader, kl_weight)
+            self.writer.add_scalar('valid_loss', valid_loss, global_step=valid_n_iter)
+            valid_n_iter += 1
+
+            if valid_loss < best_valid_loss:
+                best_valid_loss = valid_loss
+                torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'best_model.pth'))
+                print(f'model saved with valid loss: {valid_loss} at {model_checkpoints_folder}')
             
             # self._test(model, test_loader)
-
+    def _evaluate_generation(self, model, num_samples=1000):
+        model.eval()
+        valid = 0
+        unique = set()
+        
+        with torch.no_grad():
+            z = torch.randn(num_samples, model.encoder.latent_dim)
+            smiles_list = model.decode(z)
+            
+            for s in smiles_list:
+                if Chem.MolFromSmiles(s): 
+                    valid +=1
+                    unique.add(s)
+                    
+        return {
+            "validity": valid/num_samples,
+            "uniqueness": len(unique)/num_samples,
+            # "novelty": len([s for s in unique if s not in training_set])/len(unique)
+        }
     def _evaluate(self, model, loader, kl_weight):
         model.eval()
         total_loss = 0

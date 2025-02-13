@@ -6,15 +6,26 @@ from torch.nn import TransformerDecoder, TransformerDecoderLayer
 from copy import deepcopy
 
 class GraphEncoder(nn.Module):
-    def __init__(self,  pretrained_model, finetune = False):
+    def __init__(self,  pretrained_model, latent_dim = 128, finetune = False):
         super(GraphEncoder, self).__init__()
         self.pretrained_model = deepcopy(pretrained_model)
         if not finetune:
             for param in self.pretrained_model.parameters():
                 param.requires_grad = False
         hidden_size = self.pretrained_model.emb_dim
-        self.mu_layer = nn.Linear(hidden_size, hidden_size)
-        self.log_var_layer = nn.Linear(hidden_size, hidden_size)
+        # self.mu_layer = nn.Linear(hidden_size, hidden_size)
+        # self.log_var_layer = nn.Linear(hidden_size, hidden_size)
+        self.mu_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size, latent_dim))
+        
+        self.log_var_layer = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
+            nn.LeakyReLU(),
+            nn.Linear(hidden_size, latent_dim))
 
     def forward(self, data):
 
@@ -24,11 +35,10 @@ class GraphEncoder(nn.Module):
         mu = torch.tanh(mu)
         log_var = self.log_var_layer(x)
         log_var = torch.clamp(log_var,min=-4,max=0)
-        
         return mu, log_var
     
 class SMILESDecoder(nn.Module):
-    def __init__(self, vocab, max_length=128, latent_dim=300, embed_dim=128, dim_feedforward = 512, nhead=4, 
+    def __init__(self, vocab, max_length=128, latent_dim=128, embed_dim=128, dim_feedforward = 512, nhead=4, 
                  num_layers=2):
         super(SMILESDecoder, self).__init__()
         
