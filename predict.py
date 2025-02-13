@@ -75,7 +75,7 @@ class PredictorTrainer(object):
             state_dict = torch.load(checkpoints, map_location=DEVICE, weights_only=True)
             graphmodel.load_state_dict(state_dict)
         elif self.config['pretrained_model'] == 'CLR':
-            state_dict_path = './models/ckpt/CLR_model_gin.pth'
+            state_dict_path = './models/ckpt/CLR_model_MoleBERT.pth'
             CLRmodel = torch.load(state_dict_path, map_location=DEVICE, weights_only=False)
             graphmodel = CLRmodel.graphmodel
         else:

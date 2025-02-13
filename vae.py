@@ -21,7 +21,9 @@ class GraphEncoder(nn.Module):
         x = self.pretrained_model(data)
 
         mu = self.mu_layer(x)
+        mu = torch.tanh(mu)
         log_var = self.log_var_layer(x)
+        log_var = torch.clamp(log_var,min=-4,max=0)
         
         return mu, log_var
     
@@ -33,6 +35,7 @@ class SMILESDecoder(nn.Module):
         self.vocab = vocab
         self.max_length = max_length
         self.vocab_size = len(vocab)
+        self.latent_dim = latent_dim
         self.embed_dim = embed_dim
         self.hidden_vec = None
 

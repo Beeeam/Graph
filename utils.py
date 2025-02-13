@@ -92,10 +92,11 @@ class KLAnnealer:
         self.cycles = 10
 
     def get_kl_weight(self, epoch):
+        if epoch >= self.kl_anneal_epochs:
+            return self.kl_end
         if self.mode in ['linear', 'sigmoid', 'exp', 'cosine']:
             # Monotonic annealing
-            if epoch >= self.kl_anneal_epochs:
-                return self.kl_end
+
             y = epoch / self.kl_anneal_epochs
         elif self.mode == 'cyclical':
             # Cyclical annealing
