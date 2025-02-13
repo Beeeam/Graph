@@ -1,10 +1,10 @@
-batch_size: 512                  # batch size
-epochs: 200                     # total number of epochs
-eval_every_n_epochs: 1          # validation frequency
+batch_size: 256                  # batch size
+epochs: 100                     # total number of epochs
+eval_every_n_epochs: 5          # validation frequency
 # fine_tune_from: pretrained_gin  # sub directory of pre-trained model in ./ckpt
 log_every_n_steps: 20           # print training log frequency
 init_decoder_lr: 0.001   #0.0001    # initial learning rate for the prediction head
-init_encoder_lr: 0.001   #0.00008   # initial learning rate for the base GNN encoder
+init_encoder_lr: 0.0001   #0.00008   # initial learning rate for the base GNN encoder
 weight_decay: 0.0001 #0.01              # weight decay of Adam
 optimizer: adamw                 # optimizer
 scheduler: cosine               # learning rate scheduler
@@ -16,26 +16,26 @@ grad_clip: 5
 max_length: 128
 pretrained_model: MRCD                 # GNN backbone (i.e., gin/gcn)
 decoder:
-  latent_dim: 300
+  latent_dim: 128
   embed_dim: 128
   dim_feedforward: 512
   nhead: 4
   num_layers: 2
 
 kl_anneal:
-  kl_start: 0
-  kl_end: 1
-  kl_anneal_epochs: 10
-  mode: cyclical
+  kl_start: 0.001
+  kl_end: 0.5
+  kl_anneal_epochs: 100
+  mode: cyclical      # annealing mode (i.e., linear/cosine/sigmoid/exp/cyclical)
 
 dataset:
   num_workers: 0                # dataloader number of workers
-  valid_size: 0.1               # ratio of validation data
-  test_size: 0.1                # ratio of test data
+  valid_size: 0.02               # ratio of validation data
+  test_size: 0.96                # ratio of test data
   splitting: random           # data splitting (i.e., random/scaffold)
   max_seq_length: 128
   fpSize: 2048
 
-vocab_path: '/Users/bmw/Research/data/vae/pubchem_vocab.pkl'
-h5_path: '/Users/bmw/Research/data/vae/pubchem.h5'
-data_path: '/Users/bmw/Research/data/data/pubchem-10m-clean.txt'
+vocab_path: '/scratch/bwang69/data/vae/pubchem_vocab.pkl'
+# h5_path: '/Users/bmw/Research/data/vae/pubchem.h5'
+data_path: '/scratch/bwang69/data/data/pubchem-10m-clean.txt'
