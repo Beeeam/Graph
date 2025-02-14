@@ -3,23 +3,23 @@ epochs: 100                     # total number of epochs
 eval_every_n_epochs: 5          # validation frequency
 # fine_tune_from: pretrained_gin  # sub directory of pre-trained model in ./ckpt
 log_every_n_steps: 20           # print training log frequency
-init_decoder_lr: 0.001   #0.0001    # initial learning rate for the prediction head
-init_encoder_lr: 0.0001   #0.00008   # initial learning rate for the base GNN encoder
-weight_decay: 0.0001 #0.01              # weight decay of Adam
-optimizer: adamw                 # optimizer
+init_decoder_lr: 0.0005   #0.0001    # initial learning rate for the decoder
+init_encoder_lr: 0.00001   #0.00008   # initial learning rate for the base GNN encoder
+weight_decay: 0.00001 #0.01              # weight decay of Adam
+optimizer: adamw                # optimizer
 scheduler: cosine               # learning rate scheduler
 warmup_ratio: 0.05
 random_seed: 42
-finetune_flag: True
-grad_clip: 5
+finetune_flag: False
+grad_clip: 1.0
 
 max_length: 128
 pretrained_model: MRCD                 # GNN backbone (i.e., gin/gcn)
 decoder:
-  latent_dim: 128
+  latent_dim: 150
   embed_dim: 128
-  dim_feedforward: 512
-  nhead: 4
+  dim_feedforward: 256
+  nhead: 2
   num_layers: 2
 
 kl_anneal:
@@ -38,4 +38,4 @@ dataset:
 
 vocab_path: '/scratch/bwang69/data/vae/pubchem_vocab.pkl'
 # h5_path: '/Users/bmw/Research/data/vae/pubchem.h5'
-data_path: '/scratch/bwang69/data/data/pubchem-10m-clean.txt'
+data_path: '/scratch/bwang69/data/data/pubchem-10m-clean.txt' 

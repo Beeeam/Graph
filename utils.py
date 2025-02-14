@@ -76,10 +76,10 @@ def calculate_ECFP(mol, radius=2, fpSize=2048):
     fingerprint = generator.GetFingerprint(mol)
     return list(fingerprint)
 
-def vae_loss(recon_output, target, mu, log_var):
-    criterion = nn.CrossEntropyLoss()
+def vae_loss(recon_output, pad_token_id, target, mu, log_var):
+    criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
     recon_loss = criterion(recon_output.reshape(-1, recon_output.size(-1)), target.reshape(-1))
-    kl_loss = -0.5 * torch.sum(1 + log_var - mu.pow(2) - log_var.exp())
+    kl_loss = -0.5 * torch.mean(torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=-1))
     
     return recon_loss, kl_loss
 

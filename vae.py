@@ -19,13 +19,27 @@ class GraphEncoder(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.LeakyReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_size, latent_dim))
         
         self.log_var_layer = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
+            # nn.LayerNorm(hidden_size),
             nn.LeakyReLU(),
             nn.Linear(hidden_size, latent_dim))
+        
+        nn.init.constant_(self.log_var_layer[-1].bias, -1) 
+        nn.init.normal_(self.log_var_layer[-1].weight, mean=0, std=0.01)
+        
+        # for layer in [self.mu_layer, self.log_var_layer]:
+        #     for m in layer.modules():
+        #         if isinstance(m, nn.Linear):
+        #             nn.init.normal_(m.weight, mean=0, std=0.01)
+        #             if layer == self.mu_layer:
+        #                 nn.init.constant_(m.bias, 0)
+        #             else:
+        #                 nn.init.constant_(m.bias, 0)
+                    
 
     def forward(self, data):
 
@@ -34,7 +48,7 @@ class GraphEncoder(nn.Module):
         mu = self.mu_layer(x)
         mu = torch.tanh(mu)
         log_var = self.log_var_layer(x)
-        log_var = torch.clamp(log_var, min=-4, max=0)
+        log_var = torch.clamp(log_var, min=-6, max=2)
         return mu, log_var
     
 class SMILESDecoder(nn.Module):
@@ -53,17 +67,22 @@ class SMILESDecoder(nn.Module):
         self.pos_embed = nn.Embedding(max_length, embed_dim)
         
         
-        self.decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, nhead=nhead, dim_feedforward = dim_feedforward)
+        self.decoder_layer = nn.TransformerDecoderLayer(d_model=embed_dim, 
+                                                        nhead=nhead, 
+                                                        dim_feedforward = dim_feedforward, 
+                                                        dropout=0.1)
         self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(embed_dim, self.vocab_size)
 
-        self.proj = nn.Linear(latent_dim, embed_dim)
+        self.proj = nn.Linear(latent_dim, embed_dim * max_length)
         
     def forward(self, z, tgt_seq = None):
-        bsz = z.size(0)
-        device = z.device
+        
 
-        hidden_state = self.proj(z).unsqueeze(0) # (1, batch_size, embed_dim)
+        memory = self.proj(z).view(bsz, self.max_length, self.embed_dim) 
+        memory = memory.permute(1, 0, 2) # (max_length, bsz, embed_dim) 
+
+        # hidden_state = self.proj(z).unsqueeze(0) # (1, batch_size, embed_dim)
 
         if tgt_seq is None:
             logits_list, states_list = [], []
@@ -80,7 +99,7 @@ class SMILESDecoder(nn.Module):
 
                 tgt_mask = nn.Transformer.generate_square_subsequent_mask(current_seq_len).to(device)
 
-                output = self.decoder(tgt, memory=hidden_state, tgt_mask=tgt_mask)
+                output = self.decoder(tgt, memory=memory, tgt_mask=tgt_mask)
                 # memory_key_padding_mask=None, past_key_values=cache)
 
                 # logits = self.fc(output.squeeze(0))
@@ -106,17 +125,22 @@ class SMILESDecoder(nn.Module):
             return padded_logits
         
         else:
-            seq_len = tgt_seq.size(1)
-            pos = torch.arange(seq_len, device=device).expand(bsz, seq_len)
-            tgt_emb = self.embedding(tgt_seq) + self.pos_embed(pos)
+            return self._train_forward(z, memory, tgt_seq)
+            
+    def _train_forward(self, z, memory, tgt_seq):
+        bsz = z.size(0)
+        device = z.device
+        seq_len = tgt_seq.size(1)
+        pos = torch.arange(seq_len, device=device).expand(bsz, seq_len)
+        tgt_emb = self.embedding(tgt_seq) + self.pos_embed(pos)
 
-            tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device)
-            output = self.decoder(tgt_emb.permute(1, 0, 2), hidden_state, tgt_mask=tgt_mask)
-            
-            logits = self.fc(output.permute(1, 0, 2))
-            self.hidden_vec = output.permute(1, 0, 2)
-            
-            return logits
+        tgt_mask = nn.Transformer.generate_square_subsequent_mask(seq_len).to(device)
+        output = self.decoder(tgt_emb.permute(1, 0, 2), memory, tgt_mask=tgt_mask)
+        
+        logits = self.fc(output.permute(1, 0, 2))
+        self.hidden_vec = output.permute(1, 0, 2)
+        
+        return logits
 
     
 class VAE(nn.Module):
