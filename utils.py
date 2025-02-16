@@ -13,6 +13,7 @@ from rdkit.Chem.rdchem import BondType as BT
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from torch_geometric.data import Data
 
 from scipy.stats import pearsonr
@@ -76,10 +77,49 @@ def calculate_ECFP(mol, radius=2, fpSize=2048):
     fingerprint = generator.GetFingerprint(mol)
     return list(fingerprint)
 
+def compute_mmd(mu, log_var):
+    def compute_kernel(z1, z2, log_var):
+        N, D = z1.size()
+        z1 = z1.unsqueeze(1)
+        z2 = z2.unsqueeze(0)
+        assert z1.shape[-1] == z2.shape[-1], f"Dimension mismatch: {z1.shape} vs {z2.shape}"
+        sigma = 2. * torch.exp(log_var).mean(dim=-1, keepdim=True)
+        # sigma = sigma.expand(N, D) 
+        # print(sigma.shape)
+        # print(z1.shape)
+        # print(z2.shape)
+        result = torch.exp(-(z1 - z2).pow(2).mean(dim=-1) / sigma )
+        return result
+    z1 = mu + torch.exp(log_var / 2) * torch.randn_like(log_var)
+    z2 = torch.randn_like(z1)
+
+    prior_z_kernel = compute_kernel(z2, z2, torch.zeros_like(log_var))
+    z_kernel = compute_kernel(z1, z1, log_var)
+    priorz_z_kernel = compute_kernel(z2, z1, log_var)
+
+    mmd = prior_z_kernel.mean() + z_kernel.mean() - 2 * priorz_z_kernel.mean()
+    return mmd
+
+def mask_predict_vae_loss(recon_output, pad_token_id, target, mu, log_var, mask_pos, free_bits = 0.1):
+    loss = F.cross_entropy(recon_output.reshape(-1, recon_output.size(-1)), 
+                            target.reshape(-1), 
+                            ignore_index=pad_token_id,
+                            reduction = 'none')
+    # Average loss over masked positions
+    recon_loss = (loss.view(mask_pos.shape) * mask_pos).sum() / (mask_pos.sum() + 1e-10)
+    
+    # Calculate KL divergence with free bits
+    kl_per_dim = -0.5 * (1 + log_var - mu.pow(2) - log_var.exp())  # [batch_size, latent_dim]
+    # Apply free bits constraint
+    penalty = F.softplus(-(kl_per_dim - free_bits))
+    kl_loss = (kl_per_dim).sum(dim=-1).mean()
+    mmd_loss = compute_mmd(mu, log_var)
+    return recon_loss, kl_loss, mmd_loss
+
 def vae_loss(recon_output, pad_token_id, target, mu, log_var):
     criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
     recon_loss = criterion(recon_output.reshape(-1, recon_output.size(-1)), target.reshape(-1))
-    kl_loss = -0.5 * torch.mean(torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=-1))
+    kl_loss = -0.5 * (torch.sum(1 + log_var - mu.pow(2) - log_var.exp(), dim=-1)).mean()
     
     return recon_loss, kl_loss
 
@@ -125,10 +165,10 @@ class SpecialTokens:
     eos = '<eos>'
     pad = '<pad>'
     unk = '<unk>'
-
+    mask = '<mask>'
     @classmethod
     def all(cls) -> List[str]:
-        return [cls.bos, cls.eos, cls.pad, cls.unk]
+        return [cls.bos, cls.eos, cls.pad, cls.unk, cls.mask]
 
 class SMILESRegex:
     pattern = re.compile(
@@ -177,6 +217,10 @@ class SMILESVocab:
     @property
     def unk_token(self) -> str:
         return self._st.unk
+    
+    @property
+    def mask_token(self) -> str:
+        return self._st.mask
 
     @property
     def bos_idx(self) -> int:
@@ -193,6 +237,10 @@ class SMILESVocab:
     @property
     def unk_idx(self) -> int:
         return self.token2idx[self.unk_token]
+    
+    @property
+    def mask_idx(self) -> int:
+        return self.token2idx[self.mask_token]
 
     def __len__(self) -> int:
         return len(self.token2idx)
@@ -212,12 +260,12 @@ class SMILESVocab:
         padding: bool = False
     ) -> List[int]:
         tokens = self.tokenize_smiles(smiles)
-        indices = [self.token_to_idx(t) for t in tokens]
+        indices = [self.token_to_idx(t) for t in tokens if t in self.token2idx] 
         
         if add_bos:
             indices = [self.bos_idx] + indices
-        if add_eos:
-            indices = indices + [self.eos_idx]
+        if add_eos and max_length and len(indices) < max_length:
+            indices.append(self.eos_idx)
         
         if max_length is not None:
             if padding and len(indices) < max_length:
@@ -232,12 +280,18 @@ class SMILESVocab:
         indices: List[int], 
         rem_bos: bool = True, 
         rem_eos: bool = True,
-        rem_pad: bool = True
+        rem_pad: bool = True,
+        rem_unk: bool = True,
+        rem_mask: bool = True
     ) -> str:
         tokens = []
         for idx in indices:
             token = self.idx_to_token(idx)
             if rem_pad and token == self.pad_token:
+                continue
+            if rem_unk and token == self.unk_token:
+                continue
+            if rem_mask and token == self.mask_token:
                 continue
             tokens.append(token)
         

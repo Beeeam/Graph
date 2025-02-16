@@ -16,7 +16,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from rdkit import Chem
 from transformers import get_scheduler
-from utils import vae_loss, load_vocab_from_pickle, KLAnnealer
+from utils import vae_loss, load_vocab_from_pickle, KLAnnealer, mask_predict_vae_loss
 from data import MoleculeLoaderWrapper
 from vae import GraphEncoder, SMILESDecoder, VAE
 
@@ -41,13 +41,17 @@ class VAE_trainer(object):
         return DEVICE
     
     def _step(self, model, data, seq, fgp):
-        recon_logits, mu, log_var = model(data, seq[:, :-1])
+        if self.config['fgp_flag']: 
+            recon_logits, mask_pos, mu, log_var = model(data, seq[:, :-1], fgp)
+        else:
+            recon_logits, mask_pos, mu, log_var = model(data, seq[:, :-1])
+
         # print(f"Mean of latent vector: {mu.mean().item():.4f}")
         # print(f"Variance of latent vector: {log_var.exp().mean().item():.4f}")  # exp(log_var) 是标准差
 
-        recon_loss, kl_loss = vae_loss(recon_logits, pad_token_id=self.vocab.pad_idx, target=seq[:,1:], mu=mu, log_var=log_var)
+        recon_loss, kl_loss, mmd_loss = mask_predict_vae_loss(recon_logits, pad_token_id=self.vocab.pad_idx, target=seq[:,1:], mu=mu, log_var=log_var, mask_pos=mask_pos, free_bits=0.1)
 
-        return recon_loss, kl_loss
+        return recon_loss, kl_loss, mmd_loss
     
     def _get_model(self):
 
@@ -88,11 +92,11 @@ class VAE_trainer(object):
     'weight_decay':0},
     
     {"params": model.encoder.mu_layer.parameters(),
-     "lr": config['init_encoder_lr'] * 0.5,
+     "lr": config['init_decoder_lr'],
      "weight_decay": config['weight_decay']},
     
     {"params": model.encoder.log_var_layer.parameters(),
-     "lr": config['init_encoder_lr'] * 5,
+     "lr": config['init_decoder_lr'] ,
      "weight_decay": config['weight_decay']},
     
     {'params': model.decoder.parameters(), 
@@ -153,6 +157,7 @@ class VAE_trainer(object):
             tot_epoch_loss = 0
             tot_recon_loss = 0
             tot_kl_loss = 0
+            tot_mmd_loss = 0
             batch_idx = 0
             for data, seq, fgp in tqdm(train_loader,desc=f'Training Epoch {epoch+1}'):
                 optimizer.zero_grad()
@@ -161,9 +166,9 @@ class VAE_trainer(object):
                 seq = seq.to(DEVICE)
                 fgp = fgp.to(DEVICE)
                 
-                recon_loss, kl_loss = self._step(model, data, seq, fgp)
+                recon_loss, kl_loss, mmd_loss = self._step(model, data, seq, fgp)
                 kl_weight = KLAnnealer(self.config).get_kl_weight(epoch)
-                loss = recon_loss + kl_weight * kl_loss
+                loss = recon_loss + kl_weight * kl_loss + 2 * (1-kl_weight) * mmd_loss
 
                 if n_iter % self.config['log_every_n_steps'] == 0:
                     self.writer.add_scalar('recon_loss', recon_loss, global_step=n_iter)
@@ -209,28 +214,30 @@ class VAE_trainer(object):
                 tot_epoch_loss += loss.item()
                 tot_recon_loss += recon_loss.item()
                 tot_kl_loss += kl_loss.item()
+                tot_mmd_loss += mmd_loss.item()
                 n_iter += 1
                 batch_idx += 1
 
             print(
-                f"Epoch [{epoch+1}/{self.config['epochs']}], Recon_loss:{tot_recon_loss/(batch_idx):.4f}, KL_loss:{tot_kl_loss/(batch_idx):.4f}, Beta:{kl_weight}, Loss: {tot_epoch_loss/(batch_idx):.4f}"
+                f"Epoch [{epoch+1}/{self.config['epochs']}], Recon_loss:{tot_recon_loss/(batch_idx):.4f}, KL_loss:{tot_kl_loss/(batch_idx):.4f}, Beta:{kl_weight}, MMD_loss:{mmd_loss/(batch_idx):.4f}, Loss: {tot_epoch_loss/(batch_idx):.4f}"
             )
 
             if epoch % self.config['eval_every_n_epochs'] == 0:
                 profile = self._generate(model)
                 print(f"Epoch [{epoch+1}/{self.config['epochs']}], Validity: {profile['validity']:.4f}, Uniqueness: {profile['uniqueness']:.4f}")
 
-            valid_loss = self._evaluate(model, valid_loader, kl_weight)
+            valid_recon_loss, valid_kl_loss, valid_loss = self._evaluate(model, valid_loader, kl_weight)
+            # print(f"Epoch [{epoch+1}/{self.config['epochs']}], Valid_loss: {valid_loss:.4f}, Valid_recon_loss: {valid_recon_loss:.4f}, Valid_kl_loss: {valid_kl_loss:.4f}")
             self.writer.add_scalar('valid_loss', valid_loss, global_step=valid_n_iter)
             valid_n_iter += 1
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
                 torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'best_model.pth'))
-                print(f'model saved with valid loss: {valid_loss} at {model_checkpoints_folder}')
+                print(f'model saved with valid loss: {valid_loss} at {model_checkpoints_folder},KL_loss:{valid_kl_loss},Recon_loss:{valid_recon_loss}')
             
-            # self._test(model, test_loader)
-    def _generate(self, model, num_samples=1000, temperature=0.5):   
+        self._test(model, test_loader, kl_weight)
+    def _generate(self, model, num_samples=1000, num_iters=5):   
         model.eval()
         valid = 0
         unique = set()
@@ -238,13 +245,7 @@ class VAE_trainer(object):
         with torch.no_grad():
             z = torch.randn(num_samples, model.decoder.latent_dim).to(self.device)
             
-            logits = model.decoder(z)
-            prob = F.softmax(logits/temperature, dim=-1)
-
-            top_k = 5
-            top_k_probs, top_k_indices = torch.topk(prob, top_k, dim=-1)
-            samples = torch.multinomial(top_k_probs.view(-1, top_k), 1).view(prob.shape[:-1])
-            sampled_tokens = torch.gather(top_k_indices, -1, samples.unsqueeze(-1)).squeeze(-1)
+            sampled_tokens = model.decoder._generate_forward(z, num_iters)
 
             # sampled_tokens = torch.multinomial(prob.view(-1, prob.size(-1)), 1).view(prob.shape[:-1])
             generated_smiles = [self.vocab.decode(seq.cpu().numpy()) for seq in sampled_tokens]
@@ -252,7 +253,7 @@ class VAE_trainer(object):
             
             for smi in generated_smiles:
                 mol = Chem.MolFromSmiles(smi)
-                if mol is not None:
+                if mol is not None: 
                     valid += 1
                     unique.add(smi)
                     
@@ -272,16 +273,29 @@ class VAE_trainer(object):
                 seq = seq.to(self.device)
                 fgp = fgp.to(self.device)
 
-                recon_loss, kl_loss = self._step(model, data, seq, fgp)
-                loss = recon_loss + kl_weight * kl_loss
+                recon_loss, kl_loss, mmd_loss = self._step(model, data, seq, fgp)
+                loss = recon_loss + kl_weight * kl_loss + 5 * (1-kl_weight) * mmd_loss
 
                 total_loss += loss.item()
                 batch_idx += 1
-        return total_loss / batch_idx
+        return recon_loss, kl_loss, total_loss / batch_idx
     
-            # logits = model.generate(data)  
-            # smiles = [self.vocab.decode(logit.argmax(-1).tolist()) for logit in logits]
-            # print("Generated SMILES:", smiles)
+    def _test(self, model, loader, kl_weight):
+        model.eval()
+        with torch.no_grad():
+            for data, seq, fgp in tqdm(loader, desc='Testing'):
+                data = data.to(self.device)
+                seq = seq.to(self.device)
+                fgp = fgp.to(self.device) 
+
+                recon_loss, kl_loss, mmd_loss = self._step(model, data, seq, fgp)
+                loss = recon_loss + kl_weight * kl_loss + 5 * (1-kl_weight) * mmd_loss
+
+                total_loss += loss.item()
+                batch_idx += 1
+        print(f"Test loss: {total_loss / batch_idx:.4f}, Recon_loss: {recon_loss:.4f}, KL_loss: {kl_loss:.4f}")
+
+            
 
 def set_random(seed):
     random.seed(seed)  
