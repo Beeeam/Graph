@@ -9,13 +9,14 @@ from datetime import datetime
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 from torch.optim import AdamW, Adam, SGD
 from torch.nn.utils import clip_grad_norm_
 from torch.utils.tensorboard import SummaryWriter
 
 from rdkit import Chem
 from transformers import get_scheduler
-from utils import vae_loss, load_vocab_from_pickle, KLAnnealer
+from utils import vae_loss, load_vocab_from_pickle, KLAnnealer, mask_predict_vae_loss
 from data import MoleculeLoaderWrapper
 from vae import GraphEncoder, SMILESDecoder, VAE
 
@@ -40,11 +41,17 @@ class VAE_trainer(object):
         return DEVICE
     
     def _step(self, model, data, seq, fgp):
-        recon_logits, mu, log_var = model(data, seq[:, :-1])
+        if self.config['fgp_flag']: 
+            recon_logits, mask_pos, mu, log_var = model(data, seq[:, :-1], fgp)
+        else:
+            recon_logits, mask_pos, mu, log_var = model(data, seq[:, :-1])
 
-        recon_loss, kl_loss = vae_loss(recon_logits, target=seq[:,1:], mu=mu, log_var=log_var)
+        # print(f"Mean of latent vector: {mu.mean().item():.4f}")
+        # print(f"Variance of latent vector: {log_var.exp().mean().item():.4f}")  # exp(log_var) 是标准差
 
-        return recon_loss, kl_loss
+        recon_loss, kl_loss, mmd_loss = mask_predict_vae_loss(recon_logits, pad_token_id=self.vocab.pad_idx, target=seq[:,1:], mu=mu, log_var=log_var, mask_pos=mask_pos, free_bits=0.1)
+
+        return recon_loss, kl_loss, mmd_loss
     
     def _get_model(self):
 
@@ -79,32 +86,41 @@ class VAE_trainer(object):
         return vae
     
     def _get_optimizer(self, config, model, train_loader):
+        optimizer_groups = [
+    {'params': model.encoder.pretrained_model.parameters(), 
+    'lr': config['init_encoder_lr'], 
+    'weight_decay':0},
+    
+    {"params": model.encoder.mu_layer.parameters(),
+     "lr": config['init_decoder_lr'],
+     "weight_decay": config['weight_decay']},
+    
+    {"params": model.encoder.log_var_layer.parameters(),
+     "lr": config['init_decoder_lr'] ,
+     "weight_decay": config['weight_decay']},
+    
+    {'params': model.decoder.parameters(), 
+    'lr': config['init_decoder_lr'], 
+    'weight_decay':config['weight_decay']},
+]
+
         if config['optimizer'] == 'adam':
             optimizer = Adam(
-                [
-                {'params': model.encoder.parameters(), 'lr': config['init_encoder_lr'], 
-                 'weight_decay':config['weight_decay']},
-                 {'params': model.decoder.parameters(), 'lr': config['init_decoder_lr'], 
-                 'weight_decay':config['weight_decay']},
-                ]
+                optimizer_groups,
+                betas=(0.95, 0.999),  
+                eps=1e-7
             )
         elif config['optimizer'] == 'adamw':
             optimizer = AdamW(
-                [
-                {'params': model.encoder.parameters(), 'lr': config['init_encoder_lr'], 
-                 'weight_decay':config['weight_decay']},
-                 {'params': model.decoder.parameters(), 'lr': config['init_decoder_lr'], 
-                 'weight_decay':config['weight_decay']},
-                ]
+                optimizer_groups,
+                betas=(0.95, 0.999),  
+                eps=1e-7
             )
         elif config['optimizer'] == 'sgd':
             optimizer = SGD(
-                [
-                {'params': model.encoder.parameters(), 'lr': config['init_encoder_lr'], 
-                 'weight_decay':config['weight_decay'], 'momentum':0.9},
-                 {'params': model.decoder.parameters(), 'lr': config['init_decoder_lr'], 
-                 'weight_decay':config['weight_decay'], 'momentum':0.9},
-                ]
+                optimizer_groups,
+                momentum=0.9, 
+                nesterov=True
             )
         
         steps_per_epoch = len(train_loader)
@@ -141,6 +157,7 @@ class VAE_trainer(object):
             tot_epoch_loss = 0
             tot_recon_loss = 0
             tot_kl_loss = 0
+            tot_mmd_loss = 0
             batch_idx = 0
             for data, seq, fgp in tqdm(train_loader,desc=f'Training Epoch {epoch+1}'):
                 optimizer.zero_grad()
@@ -149,18 +166,47 @@ class VAE_trainer(object):
                 seq = seq.to(DEVICE)
                 fgp = fgp.to(DEVICE)
                 
-                recon_loss, kl_loss = self._step(model, data, seq, fgp)
+                recon_loss, kl_loss, mmd_loss = self._step(model, data, seq, fgp)
                 kl_weight = KLAnnealer(self.config).get_kl_weight(epoch)
-                loss = recon_loss + kl_weight * kl_loss
+                loss = recon_loss + kl_weight * kl_loss + 2 * (1-kl_weight) * mmd_loss
 
                 if n_iter % self.config['log_every_n_steps'] == 0:
                     self.writer.add_scalar('recon_loss', recon_loss, global_step=n_iter)
                     self.writer.add_scalar('kl_loss', kl_loss, global_step=n_iter)
                     self.writer.add_scalar('kl_weight', kl_weight, global_step=n_iter)
                     self.writer.add_scalar('train_loss', loss, global_step=n_iter)
+
+                # if batch_idx ==0 and epoch==0:
+                #     print("\n--- First Batch Debug ---")
+                #     print(f"Pre-update KL: {kl_loss.item():.3e}")
+                #     print("Gradients before clip:")
+                #     for name, param in model.named_parameters():
+                #         if param.grad is not None:
+                #             print(f"{name}: {param.grad.abs().mean():.3e}")
+                    
+                #     loss.backward()
+                    
+                    
+                #     print("\nGradients after backward:")
+                #     for name, param in model.named_parameters():
+                #         if param.grad is not None:
+                #             print(f"{name}: {param.grad.abs().mean():.3e}")
+                #     torch.nn.utils.clip_grad_value_(model.parameters(), 1)
+                #     optimizer.step()
+                    
+                #     # 立即检查参数更新量
+                #     with torch.no_grad():
+                #         delta = []
+                #         for name, param in model.named_parameters():
+                #             if param.grad is not None:
+                #                 delta.append(param.data.abs().mean().item())
+                #         print(f"Param delta mean: {np.mean(delta):.3e}")
+                    
+                #     exit() 
                 
                 loss.backward()
                 clip_grad_norm_(model.parameters(),max_norm=self.config['grad_clip'])
+                
 
                 optimizer.step()
                 scheduler.step()
@@ -168,40 +214,48 @@ class VAE_trainer(object):
                 tot_epoch_loss += loss.item()
                 tot_recon_loss += recon_loss.item()
                 tot_kl_loss += kl_loss.item()
+                tot_mmd_loss += mmd_loss.item()
                 n_iter += 1
                 batch_idx += 1
 
             print(
-                f"Epoch [{epoch+1}/{self.config['epochs']}], Recon_loss:{tot_recon_loss/(batch_idx):.4f}, KL_loss:{tot_kl_loss/(batch_idx):.4f}, Beta:{kl_weight}, Loss: {tot_epoch_loss/(batch_idx):.4f}"
+                f"Epoch [{epoch+1}/{self.config['epochs']}], Recon_loss:{tot_recon_loss/(batch_idx):.4f}, KL_loss:{tot_kl_loss/(batch_idx):.4f}, Beta:{kl_weight}, MMD_loss:{mmd_loss/(batch_idx):.4f}, Loss: {tot_epoch_loss/(batch_idx):.4f}"
             )
 
             if epoch % self.config['eval_every_n_epochs'] == 0:
-                profile = self._evaluate_generation(model)
+                profile = self._generate(model)
                 print(f"Epoch [{epoch+1}/{self.config['epochs']}], Validity: {profile['validity']:.4f}, Uniqueness: {profile['uniqueness']:.4f}")
 
-            valid_loss = self._evaluate(model, valid_loader, kl_weight)
+            valid_recon_loss, valid_kl_loss, valid_loss = self._evaluate(model, valid_loader, kl_weight)
+            # print(f"Epoch [{epoch+1}/{self.config['epochs']}], Valid_loss: {valid_loss:.4f}, Valid_recon_loss: {valid_recon_loss:.4f}, Valid_kl_loss: {valid_kl_loss:.4f}")
             self.writer.add_scalar('valid_loss', valid_loss, global_step=valid_n_iter)
             valid_n_iter += 1
 
             if valid_loss < best_valid_loss:
                 best_valid_loss = valid_loss
                 torch.save(model.state_dict(), os.path.join(model_checkpoints_folder, 'best_model.pth'))
-                print(f'model saved with valid loss: {valid_loss} at {model_checkpoints_folder}')
+                print(f'model saved with valid loss: {valid_loss} at {model_checkpoints_folder},KL_loss:{valid_kl_loss},Recon_loss:{valid_recon_loss}')
             
-            # self._test(model, test_loader)
-    def _evaluate_generation(self, model, num_samples=1000):
+        self._test(model, test_loader, kl_weight)
+    def _generate(self, model, num_samples=1000, num_iters=5):   
         model.eval()
         valid = 0
         unique = set()
         
         with torch.no_grad():
-            z = torch.randn(num_samples, model.encoder.latent_dim)
-            smiles_list = model.decode(z)
+            z = torch.randn(num_samples, model.decoder.latent_dim).to(self.device)
             
-            for s in smiles_list:
-                if Chem.MolFromSmiles(s): 
-                    valid +=1
-                    unique.add(s)
+            sampled_tokens = model.decoder._generate_forward(z, num_iters)
+
+            # sampled_tokens = torch.multinomial(prob.view(-1, prob.size(-1)), 1).view(prob.shape[:-1])
+            generated_smiles = [self.vocab.decode(seq.cpu().numpy()) for seq in sampled_tokens]
+            
+            
+            for smi in generated_smiles:
+                mol = Chem.MolFromSmiles(smi)
+                if mol is not None: 
+                    valid += 1
+                    unique.add(smi)
                     
         return {
             "validity": valid/num_samples,
@@ -219,16 +273,29 @@ class VAE_trainer(object):
                 seq = seq.to(self.device)
                 fgp = fgp.to(self.device)
 
-                recon_loss, kl_loss = self._step(model, data, seq, fgp)
-                loss = recon_loss + kl_weight * kl_loss
+                recon_loss, kl_loss, mmd_loss = self._step(model, data, seq, fgp)
+                loss = recon_loss + kl_weight * kl_loss + 5 * (1-kl_weight) * mmd_loss
 
                 total_loss += loss.item()
                 batch_idx += 1
-        return total_loss / batch_idx
+        return recon_loss, kl_loss, total_loss / batch_idx
     
-            # logits = model.generate(data)  
-            # smiles = [self.vocab.decode(logit.argmax(-1).tolist()) for logit in logits]
-            # print("Generated SMILES:", smiles)
+    def _test(self, model, loader, kl_weight):
+        model.eval()
+        with torch.no_grad():
+            for data, seq, fgp in tqdm(loader, desc='Testing'):
+                data = data.to(self.device)
+                seq = seq.to(self.device)
+                fgp = fgp.to(self.device) 
+
+                recon_loss, kl_loss, mmd_loss = self._step(model, data, seq, fgp)
+                loss = recon_loss + kl_weight * kl_loss + 5 * (1-kl_weight) * mmd_loss
+
+                total_loss += loss.item()
+                batch_idx += 1
+        print(f"Test loss: {total_loss / batch_idx:.4f}, Recon_loss: {recon_loss:.4f}, KL_loss: {kl_loss:.4f}")
+
+            
 
 def set_random(seed):
     random.seed(seed)  

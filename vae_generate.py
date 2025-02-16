@@ -65,7 +65,7 @@ class vaegenerator(object):
         else:
             raise ValueError(f"No pretrainedmodel: {self.config['pretrained_model']}")
         
-        encoder = GraphEncoder(graphmodel, latent_dim=self.config['decoder']['latent_dim'],finetune=self.config['finetune_flag'])
+        encoder = GraphEncoder(graphmodel, latent_dim=self.config['decoder']['latent_dim'], finetune=self.config['finetune_flag'])
         decoder = SMILESDecoder(vocab=self.vocab, max_length=self.config['max_length'], **self.config['decoder'])
         vae = VAE(encoder=encoder, decoder=decoder)
         return vae
