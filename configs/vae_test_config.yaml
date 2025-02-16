@@ -22,10 +22,10 @@ max_length: 128
 pretrained_model: MRCD                 # GNN backbone (i.e., gin/gcn)
 model_path: /Users/bmw/Research/Generate/ckpt/vae/best_model.pth
 decoder:
-  latent_dim: 300
+  latent_dim: 150
   embed_dim: 128
-  dim_feedforward: 512
-  nhead: 4
+  dim_feedforward: 256
+  nhead: 2
   num_layers: 2
 
 # kl_anneal:

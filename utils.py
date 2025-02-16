@@ -125,10 +125,10 @@ class SpecialTokens:
     eos = '<eos>'
     pad = '<pad>'
     unk = '<unk>'
-
+    mask = '<mask>'
     @classmethod
     def all(cls) -> List[str]:
-        return [cls.bos, cls.eos, cls.pad, cls.unk]
+        return [cls.bos, cls.eos, cls.pad, cls.unk, cls.mask]
 
 class SMILESRegex:
     pattern = re.compile(
@@ -177,6 +177,10 @@ class SMILESVocab:
     @property
     def unk_token(self) -> str:
         return self._st.unk
+    
+    @property
+    def mask_token(self) -> str:
+        return self._st.mask
 
     @property
     def bos_idx(self) -> int:
@@ -193,6 +197,10 @@ class SMILESVocab:
     @property
     def unk_idx(self) -> int:
         return self.token2idx[self.unk_token]
+    
+    @property
+    def mask_idx(self) -> int:
+        return self.token2idx[self.mask_token]
 
     def __len__(self) -> int:
         return len(self.token2idx)
@@ -212,12 +220,12 @@ class SMILESVocab:
         padding: bool = False
     ) -> List[int]:
         tokens = self.tokenize_smiles(smiles)
-        indices = [self.token_to_idx(t) for t in tokens]
+        indices = [self.token_to_idx(t) for t in tokens if t in self.token2idx] 
         
         if add_bos:
             indices = [self.bos_idx] + indices
-        if add_eos:
-            indices = indices + [self.eos_idx]
+        if add_eos and max_length and len(indices) < max_length:
+            indices.append(self.eos_idx)
         
         if max_length is not None:
             if padding and len(indices) < max_length:
@@ -232,12 +240,18 @@ class SMILESVocab:
         indices: List[int], 
         rem_bos: bool = True, 
         rem_eos: bool = True,
-        rem_pad: bool = True
+        rem_pad: bool = True,
+        rem_unk: bool = True,
+        rem_mask: bool = True
     ) -> str:
         tokens = []
         for idx in indices:
             token = self.idx_to_token(idx)
             if rem_pad and token == self.pad_token:
+                continue
+            if rem_unk and token == self.unk_token:
+                continue
+            if rem_mask and token == self.mask_token:
                 continue
             tokens.append(token)
         

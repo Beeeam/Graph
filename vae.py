@@ -19,13 +19,17 @@ class GraphEncoder(nn.Module):
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
             nn.LeakyReLU(),
+            nn.Dropout(0.1),
             nn.Linear(hidden_size, latent_dim))
         
         self.log_var_layer = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
-            nn.LayerNorm(hidden_size),
+            # nn.LayerNorm(hidden_size),
             nn.LeakyReLU(),
             nn.Linear(hidden_size, latent_dim))
+        
+        nn.init.constant_(self.log_var_layer[-1].bias, -1) 
+        nn.init.normal_(self.log_var_layer[-1].weight, mean=0, std=0.01)
 
     def forward(self, data):
 
@@ -34,7 +38,7 @@ class GraphEncoder(nn.Module):
         mu = self.mu_layer(x)
         mu = torch.tanh(mu)
         log_var = self.log_var_layer(x)
-        log_var = torch.clamp(log_var,min=-4,max=0)
+        log_var = torch.clamp(log_var, min=-6, max=2)
         return mu, log_var
     
 class SMILESDecoder(nn.Module):
@@ -57,13 +61,17 @@ class SMILESDecoder(nn.Module):
         self.decoder = nn.TransformerDecoder(self.decoder_layer, num_layers=num_layers)
         self.fc = nn.Linear(embed_dim, self.vocab_size)
 
-        self.proj = nn.Linear(latent_dim, embed_dim)
+        # self.proj = nn.Linear(latent_dim, embed_dim)
+        self.proj = nn.Linear(latent_dim, embed_dim * max_length)
         
     def forward(self, z, tgt_seq = None):
         bsz = z.size(0)
         device = z.device
 
-        hidden_state = self.proj(z).unsqueeze(0) # (1, batch_size, embed_dim)
+        memory = self.proj(z).view(bsz, self.max_length, self.embed_dim) 
+        hidden_state = memory.permute(1, 0, 2) # (max_length, bsz, embed_dim) 
+
+        # hidden_state = self.proj(z).unsqueeze(0) # (1, batch_size, embed_dim)
 
         if tgt_seq is None:
             logits_list, states_list = [], []
