@@ -1,23 +1,29 @@
-batch_size: 16                  # batch size
+batch_size: 32                  # batch size
 epochs: 200                     # total number of epochs
 eval_every_n_epochs: 1          # validation frequency
 # fine_tune_from: pretrained_gin  # sub directory of pre-trained model in ./ckpt
 log_every_n_steps: 50           # print training log frequency
-init_lr: 0.0043   #0.0001              # initial learning rate for the prediction head
-init_base_lr: 0.0038   #0.00008   # initial learning rate for the base GNN encoder
-weight_decay: 0.008              # weight decay of Adam
+init_lr: 0.001              # initial learning rate for the prediction head
+init_base_lr: 0.0001             # initial learning rate for the base GNN encoder
+weight_decay: 0.0001              # weight decay of Adam
 optimizer: adamw                 # optimizer
 scheduler: cosine               # learning rate scheduler
-warmup_ratio: 0.09
-random_seed: 42
-finetune_flag: True
+warmup_ratio: 0.5
+random_seed: 3407
+finetune_flag: True          # whether to finetune the model
 
+# mode: test
+# finetune_from: '/Users/bmw/Research/Generate/ckpt/finetune/dataset_scaffold/Jun04_14-58-59__CO2'
+finetune_from: None
 pretrained_model: CLR                 # GNN backbone (i.e., gin/gcn)
 drop_out: 0.3 #0.3
 
 dataset:
-  data_path: '/Users/bmw/Research/data/data/data.csv'
+  train_data_path: '/Users/bmw/Research/data/data/poly_train2.csv'
+  valid_data_path: '/Users/bmw/Research/data/data/poly_valid2.csv'
+  test_data_path: '/Users/bmw/Research/data/data/poly_test2.csv'
   num_workers: 0                # dataloader number of workers
   valid_size: 0.1               # ratio of validation data
   test_size: 0.1                # ratio of test data
   splitting: random           # data splitting (i.e., random/scaffold)
+  seed: 199

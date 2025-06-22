@@ -7,7 +7,12 @@ import numpy as np
 from copy import deepcopy
 
 import torch
+from torch.utils.data import ConcatDataset
 from torch.utils.data.sampler import SubsetRandomSampler
+from torchmetrics import R2Score, MeanSquaredError
+from torch_geometric.utils.num_nodes import maybe_num_nodes
+from torch_geometric.utils import (get_laplacian, to_scipy_sparse_matrix,
+                                   to_undirected, to_dense_adj, scatter)
 
 from rdkit import Chem
 from rdkit.Chem import AllChem
@@ -45,10 +50,11 @@ class PolyDataset(Dataset):
     def __init__(self, data, targets):
         super(PolyDataset, self).__init__()
         self.data = data
-        self.targets = [targets]
+        self.targets = [targets] if isinstance(targets, str) else targets
         # print(self.targets)
         assert all(target in ['CO2', 'O2', 'N2', 'CO2/O2', 'CO2/N2'] for target in self.targets)
         self.smiles_data = self.data['SMILES'].values
+        
 
     def __getitem__(self, idx):
         molecule_str = self.data['SMILES'].values[idx]
@@ -86,7 +92,7 @@ class PolyDataset(Dataset):
         # x2 = torch.tensor([atomic_number, aromatic, sp, sp2, sp3, sp3d, num_hs],
         #                     dtype=torch.float).t().contiguous()
         # x = torch.cat([x1.to(torch.float), x2], dim=-1)
-
+        
         row, col, edge_feat = [], [], []
         for bond in mol.GetBonds():
             start, end = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
@@ -104,6 +110,19 @@ class PolyDataset(Dataset):
 
         edge_index = torch.tensor([row, col], dtype=torch.long)
         edge_attr = torch.tensor(np.array(edge_feat), dtype=torch.long)
+        # print(f"edge_index: {edge_index.shape}, edge_attr: {edge_attr.shape}")
+
+        # kernel_param = range(1,21)
+        # N = x.shape[0]
+        # rw_landing, edge_features = get_rw_landing_probs_and_edge_features(ksteps=kernel_param,
+        #                                   edge_index=edge_index,
+        #                                   num_nodes=N)
+        # # print(edge_features)
+        # if edge_attr.dim() == 1:
+        #     edge_attr = torch.cat([edge_attr.unsqueeze(dim=-1), edge_features], dim=1)
+        # else:
+        #     edge_attr = torch.cat([edge_attr, edge_features], dim=1)
+        # print(f"edge_attr: {edge_attr.shape}")
 
         labels = self.data.iloc[idx][self.targets].values
         # labels = (labels - self.mean) / self.std
@@ -177,11 +196,14 @@ def scaffold_split(dataset, valid_size, test_size, seed=None, log_every_n=1000):
 class PolyGNNLoaderWrapper(object):
     
     def __init__(self, 
-        batch_size, data_path, num_workers, valid_size,  
+        batch_size, train_data_path, valid_data_path, test_data_path,
+        num_workers, valid_size,  
         test_size, splitting, targets, seed = None
     ):
         super(object, self).__init__()
-        self.data = pd.read_csv(data_path)
+        self.train_data = pd.read_csv(train_data_path)
+        self.valid_data = pd.read_csv(valid_data_path)
+        self.test_data = pd.read_csv(test_data_path)
         self.batch_size = batch_size
         self.num_workers = num_workers
         self.valid_size = valid_size
@@ -194,42 +216,105 @@ class PolyGNNLoaderWrapper(object):
         assert splitting in ['random', 'scaffold']
 
     def get_data_loaders(self):
-        train_dataset = PolyDataset(data=self.data, targets=self.targets)
-        train_loader, valid_loader, test_loader = self.get_train_validation_data_loaders(train_dataset)
+        train_dataset = PolyDataset(data=self.train_data, targets=self.targets)
+        valid_dataset = PolyDataset(data=self.valid_data, targets=self.targets)
+        test_dataset = PolyDataset(data=self.test_data, targets=self.targets)
+        train_loader, valid_loader, test_loader = self.get_train_validation_data_loaders(train_dataset, valid_dataset, test_dataset)
         return train_loader, valid_loader, test_loader
 
-    def get_train_validation_data_loaders(self, train_dataset):
+    def get_train_validation_data_loaders(self, train_dataset, valid_dataset, test_dataset):
         if self.splitting == 'random':
             # obtain training indices that will be used for validation
-            print('Dataset is random splitting...')
-            num_train = len(train_dataset)
-            indices = list(range(num_train))
-            np.random.shuffle(indices)
-
-            split = int(np.floor(self.valid_size * num_train))
-            split2 = int(np.floor(self.test_size * num_train))
-            valid_idx, test_idx, train_idx = indices[:split], indices[split:split+split2], indices[split+split2:]
+            train_loader = DataLoader(
+                            train_dataset, batch_size=self.batch_size, shuffle=True, 
+                            num_workers=self.num_workers, drop_last=False
+                        )
+            valid_loader = DataLoader(
+                            valid_dataset, batch_size=self.batch_size, shuffle=True, 
+                            num_workers=self.num_workers, drop_last=False
+                        )
+            test_loader = DataLoader(
+                            test_dataset, batch_size=self.batch_size, shuffle=True, 
+                            num_workers=self.num_workers, drop_last=False
+                        )
         
         elif self.splitting == 'scaffold':
             print('Dataset is scaffold splitting...')
+            train_dataset = ConcatDataset([train_dataset, valid_dataset, test_dataset])
             train_idx, valid_idx, test_idx = scaffold_split(train_dataset, self.valid_size, self.test_size)
 
         # define samplers for obtaining training and validation batches
-        train_sampler = SubsetRandomSampler(train_idx)
-        valid_sampler = SubsetRandomSampler(valid_idx)
-        test_sampler = SubsetRandomSampler(test_idx)
+            train_sampler = SubsetRandomSampler(train_idx)
+            valid_sampler = SubsetRandomSampler(valid_idx)
+            test_sampler = SubsetRandomSampler(test_idx)
 
-        train_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, sampler=train_sampler,
-            num_workers=self.num_workers, drop_last=False
-        )
-        valid_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, sampler=valid_sampler,
-            num_workers=self.num_workers, drop_last=False
-        )
-        test_loader = DataLoader(
-            train_dataset, batch_size=self.batch_size, sampler=test_sampler,
-            num_workers=self.num_workers, drop_last=False
-        )
+            train_loader = DataLoader(
+                train_dataset, batch_size=self.batch_size, sampler=train_sampler,
+                num_workers=self.num_workers, drop_last=False
+            )
+            valid_loader = DataLoader(
+                train_dataset, batch_size=self.batch_size, sampler=valid_sampler,
+                num_workers=self.num_workers, drop_last=False
+            )
+            test_loader = DataLoader(
+                train_dataset, batch_size=self.batch_size, sampler=test_sampler,
+                num_workers=self.num_workers, drop_last=False
+            )
 
         return train_loader, valid_loader, test_loader
+
+
+def get_rw_landing_probs_and_edge_features(ksteps, edge_index, edge_weight=None,
+                                           num_nodes=None, space_dim=0):
+    """
+    https://github.com/LUOyk1999/GNNPlus/blob/main/GNNPlus/transform/posenc_stats.py
+    Compute Random Walk landing probabilities for given list of K steps,
+    and extract random walk probabilities for edges defined in edge_index.
+    
+    Args:
+        ksteps: List of k-steps for which to compute the RW landings
+        edge_index: PyG sparse representation of the graph
+        edge_weight: (optional) Edge weights
+        num_nodes: (optional) Number of nodes in the graph
+        space_dim: (optional) Estimated dimensionality of the space. Used to
+            correct the random-walk diagonal by a factor `k^(space_dim/2)`.
+    
+    Returns:
+        rw_landing: 2D Tensor with shape (num_nodes, len(ksteps)) with RW landing probs
+        edge_features: Tensor with shape (num_edges, len(ksteps)), RW probs for edges
+    """
+    if edge_weight is None:
+        edge_weight = torch.ones(edge_index.size(1), device=edge_index.device)
+    num_nodes = maybe_num_nodes(edge_index, num_nodes)
+    source, dest = edge_index[0], edge_index[1]
+    deg = scatter(edge_weight, source, dim=0, dim_size=num_nodes, reduce='sum')  # Out degrees.
+    deg_inv = deg.pow(-1.)
+    deg_inv.masked_fill_(deg_inv == float('inf'), 0)
+
+    # Transition matrix P = D^-1 * A
+    adj = to_dense_adj(edge_index, edge_attr=edge_weight, max_num_nodes=num_nodes).squeeze(0)  # (Num nodes) x (Num nodes)
+    P = torch.diag(deg_inv) @ adj  # Transition matrix
+
+    rws = []
+    edge_features = []
+    if ksteps == list(range(min(ksteps), max(ksteps) + 1)):
+        # Efficient way if ksteps are a consecutive sequence
+        Pk = P.clone().detach().matrix_power(min(ksteps))
+        for k in range(min(ksteps), max(ksteps) + 1):
+            rws.append(torch.diagonal(Pk, dim1=-2, dim2=-1) * \
+                       (k ** (space_dim / 2)))
+            edge_features.append(Pk[source, dest] * (k ** (space_dim / 2)))
+            Pk = Pk @ P
+    else:
+        # Explicitly raising P to power k for each k \in ksteps.
+        for k in ksteps:
+            Pk = P.matrix_power(k)
+            rws.append(torch.diagonal(Pk, dim1=-2, dim2=-1) * \
+                       (k ** (space_dim / 2)))
+            edge_features.append(Pk[source, dest] * (k ** (space_dim / 2)))
+
+    rw_landing = torch.stack(rws, dim=1)  # (Num nodes) x (K steps)
+    edge_features = torch.stack(edge_features, dim=1)  # (Num edges) x (K steps)
+    edge_features = edge_features.long()  # Convert to long type for consistency
+
+    return rw_landing, edge_features

@@ -21,24 +21,37 @@ class GINEConv(MessagePassing):
             nn.ReLU(), 
             nn.Linear(2*emb_dim, emb_dim)
         )
+
+       
         self.edge_embedding1 = nn.Embedding(num_bond_type, emb_dim)
         self.edge_embedding2 = nn.Embedding(num_bond_direction, emb_dim)
+
+        # self.edge_encoder = nn.Sequential(
+        #     nn.Linear(20, 2*emb_dim), 
+        #     nn.ReLU(), 
+        #     nn.Linear(2*emb_dim, emb_dim)
+        # )
 
         nn.init.xavier_uniform_(self.edge_embedding1.weight.data)
         nn.init.xavier_uniform_(self.edge_embedding2.weight.data)
 
+
+
     def forward(self, x, edge_index, edge_attr):
-        # add self loops in the edge space
         edge_index = add_self_loops(edge_index, num_nodes=x.size(0))[0]
+        # print(edge_attr.size())
 
         # add features corresponding to self-loop edges.
-        self_loop_attr = torch.zeros(x.size(0), 2)
+        self_loop_attr = torch.zeros(x.size(0), edge_attr.size(1), dtype=edge_attr.dtype, device=edge_attr.device)
         self_loop_attr[:,0] = 4 # bond type for self-loop edge
         self_loop_attr = self_loop_attr.to(edge_attr.device).to(edge_attr.dtype)
         edge_attr = torch.cat((edge_attr, self_loop_attr), dim=0)
+        # print(edge_attr.size())
 
+        # edge_embeddings = self.edge_embedding1(edge_attr[:,0]) + \
+        #     self.edge_embedding2(edge_attr[:,1]) 
         edge_embeddings = self.edge_embedding1(edge_attr[:,0]) + \
-            self.edge_embedding2(edge_attr[:,1])
+            self.edge_embedding2(edge_attr[:,1]) #+ self.edge_encoder(edge_attr[:,2:].float())
 
         return self.propagate(edge_index, x=x, edge_attr=edge_embeddings)
 
@@ -91,6 +104,15 @@ class GINet(nn.Module):
             self.pool = global_max_pool
         elif pool == 'add':
             self.pool = global_add_pool
+
+        self.norm1_local = nn.BatchNorm1d(emb_dim)
+        self.ff_linear1 = nn.Linear(emb_dim, emb_dim*2)
+        self.ff_linear2 = nn.Linear(emb_dim*2, emb_dim)
+        self.act_fn_ff = nn.ReLU()
+
+        self.norm2 = nn.BatchNorm1d(emb_dim)
+        self.ff_dropout1 = nn.Dropout(0.1)
+        self.ff_dropout2 = nn.Dropout(0.1)
         # self.feat_lin = nn.Linear(self.emb_dim, self.feat_dim)
 
         # if self.task == 'classification':
@@ -126,13 +148,21 @@ class GINet(nn.Module):
         
         # pred_head.append(nn.Linear(self.feat_dim//2, out_dim))
         # self.pred_head = nn.Sequential(*pred_head)
-
+    def _ff_block(self,x):
+        """
+        Feed Forward block.
+        """
+        x = self.ff_dropout1(self.act_fn_ff(self.ff_linear1(x)))
+        return self.ff_dropout2(self.ff_linear2(x))
+    
     def forward(self, data):
+
         x = data.x
         edge_index = data.edge_index
         edge_attr = data.edge_attr
         
         h = self.x_embedding1(x[:,0]) + self.x_embedding2(x[:,1])
+        h0 = h
 
         for layer in range(self.num_layer):
             h = self.gnns[layer](h, edge_index, edge_attr)
@@ -141,6 +171,9 @@ class GINet(nn.Module):
                 h = F.dropout(h, self.drop_ratio, training=self.training)
             else:
                 h = F.dropout(F.relu(h), self.drop_ratio, training=self.training)
+            # h = h + h0
+
+            # h = h + self._ff_block(h)
 
         h = self.pool(h, data.batch)
         # h = self.feat_lin(h)

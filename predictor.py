@@ -10,7 +10,7 @@ from copy import deepcopy
 class Property_predictor(nn.Module):
     """multitask prediction models."""
 
-    def __init__(self, pretrained_model, drop_out, finetune=True):
+    def __init__(self, pretrained_model, drop_out=0.3, finetune=True, num_tasks=1):
         super(Property_predictor, self).__init__()
         self.Pretrained_model = deepcopy(pretrained_model)
         if not finetune:
@@ -18,13 +18,14 @@ class Property_predictor(nn.Module):
                 param.requires_grad = False
         hidden_size = self.Pretrained_model.emb_dim
         self.hidden_layer = nn.Sequential( 
-            nn.LayerNorm(hidden_size),          
-            nn.Linear(hidden_size, hidden_size//2),
+            nn.LayerNorm(hidden_size),    
+            # nn.Dropout(drop_out),      
+            nn.Linear(hidden_size, hidden_size),
             nn.ReLU(),
             nn.Dropout(drop_out),
         )
 
-        self.reg_layer = nn.Linear(hidden_size//2, 1)
+        self.reg_layer = nn.Linear(hidden_size, num_tasks)
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -40,7 +41,9 @@ class Property_predictor(nn.Module):
 
     def forward(self, data):
         x = self.Pretrained_model(data)
+        res = x
         x = self.hidden_layer(x)
+        x = x + res  # residual connection
         reg_out = self.reg_layer(x)
 
         return reg_out

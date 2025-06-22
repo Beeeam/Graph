@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from transformers import get_scheduler
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 
-from graph_loader import PolyGNNLoaderWrapper
+from graph_loader import PolyGNNLoaderWrapper, PolyDataset
 from predictor import Property_predictor
 from utils import load_vocab_from_pickle
 
@@ -36,7 +36,15 @@ class PredictorTrainer(object):
         self.device = self._get_device()
 
         current_time = datetime.now().strftime('%b%d_%H-%M-%S')
-        dir_name = current_time + '_'  + '_' + config['dataset']['targets']
+        # dir_name = current_time + '_'  + '_' + config['dataset']['targets']
+        self.task_names = config['dataset']['targets']
+        if isinstance(self.task_names, list):
+            targets_str = '-'.join(self.task_names)
+        else:
+            targets_str = self.task_names
+            self.task_names = [self.task_names]
+
+        dir_name = current_time + '__' + targets_str
         log_dir = os.path.join('ckpt/finetune', dir_name)
         self.writer = SummaryWriter(log_dir=log_dir)
         self.dataset = dataset
@@ -55,7 +63,7 @@ class PredictorTrainer(object):
     
     def train(self):
         train_loader, valid_loader, test_loader = self.dataset.get_data_loaders()
-        
+               
         if self.config['pretrained_model'] == 'MolCLR':
             from models.gin import GINet
             graphmodel = GINet(num_layer=5, emb_dim=300, drop_ratio=0.3, pool='mean')
@@ -75,15 +83,98 @@ class PredictorTrainer(object):
             state_dict = torch.load(checkpoints, map_location=DEVICE, weights_only=True)
             graphmodel.load_state_dict(state_dict)
         elif self.config['pretrained_model'] == 'CLR':
-            state_dict_path = './models/ckpt/CLR_model_MoleBERT.pth'
+            from models.gin import GINet
+            graphmodel = GINet(num_layer=5, emb_dim=300, drop_ratio=0.3, pool='mean') 
+            state_dict_path = './models/ckpt/CLR_model_MolCLR.pth'
+            # checkpoints = './models/ckpt/CLR_GIN.pth'
             CLRmodel = torch.load(state_dict_path, map_location=DEVICE, weights_only=False)
+            # state_dict = torch.load(checkpoints, map_location=DEVICE, weights_only=True)
+            # graphmodel.load_my_state_dict(state_dict)
             graphmodel = CLRmodel.graphmodel
+        elif self.config['pretrained_model'] == 'scratch':
+            from models.gin import GINet
+            graphmodel = GINet(num_layer=5, emb_dim=300, drop_ratio=0.3, pool='mean')
         else:
             raise ValueError(f"No pretrainedmodel: {self.config['pretrained_model']}")
         
-        predictor = Property_predictor(graphmodel, drop_out=self.config['drop_out'], finetune=self.config['finetune_flag']).to(self.device)
-        
+        predictor = Property_predictor(graphmodel, drop_out=self.config['drop_out'], finetune=self.config['finetune_flag'], num_tasks = len(self.task_names)).to(self.device)
+        print('num_tasks:', len(self.task_names))
+        if self.config['finetune_from'] is not None:
+            self._load_pre_trained_weights(predictor)
+        predictions = []
+        labels = []
 
+        predictor.eval()
+        with torch.no_grad():
+            test_loss = 0
+            num_data = 0
+
+            for data, fingerprint in tqdm(test_loader):
+                data = data.to(self.device)
+                pred = predictor(data)
+                label = data.y.view(pred.shape).to(torch.float32)
+                loss = self._step(predictor, data)
+
+                test_loss += loss.item() * data.y.size(0)
+                num_data += data.y.size(0)
+
+                if self.device == 'cpu':
+                    predictions.append(pred.detach().numpy())
+                    # labels.extend(data.y.flatten().numpy())
+                    # labels.append(data.y.cpu().numpy()) 
+                    labels.append(label.cpu().numpy())
+                else:
+                    predictions.append(pred.cpu().detach().numpy())
+                    # labels.extend(data.y.cpu().flatten().numpy())
+                    # labels.append(data.y.cpu().numpy())
+                    labels.append(label.cpu().numpy())
+        
+        predictions = np.concatenate(predictions, axis=0)  # shape: (total_samples, num_tasks)
+        labels = np.concatenate(labels, axis=0)            # shape: (total_samples, num_tasks)
+
+        if predictions.ndim == 1 or labels.ndim == 1:
+            predictions = predictions.reshape(-1, 1)
+            labels = labels.reshape(-1, 1)
+        # print('predictions shape:', predictions.shape, 'labels shape:', labels.shape)
+        assert predictions.shape == labels.shape
+        assert predictions.shape[1] == len(self.task_names)
+        self.rmse = {name: mean_squared_error(labels[:, i], predictions[:, i]) ** 0.5
+                    for i, name in enumerate(self.task_names)}
+        self.r2 = {name: r2_score(labels[:, i], predictions[:, i])
+                for i, name in enumerate(self.task_names)} 
+
+        # print('Test loss:', test_loss / num_data, 'Test RMSE:', self.rmse, 'Test R2:', self.r2)
+        print("Test RMSE:")
+        for task, rmse in self.rmse.items():
+            print(f"  {task}: {rmse:.4f}")
+        print("Test R²:")
+        for task, r2 in self.r2.items():
+            print(f"  {task}: {r2:.4f}")
+        # if self.config['mode'] == 'test':
+        #     predictor.eval()
+        #     with torch.no_grad():
+        #         test_loss = 0
+        #         num_data = 0
+
+        #         for data, fingerprint in tqdm(train_loader):
+        #             data = data.to(self.device)
+        #             pred = predictor(data)
+        #             label = data.y.view(pred.shape).to(torch.float32)
+        #             loss = self._step(predictor, data)
+
+        #             test_loss += loss.item() * data.y.size(0)
+        #             num_data += data.y.size(0)
+
+        #             if self.device == 'cpu':
+        #                 predictions.extend(pred.detach().numpy())
+        #                 labels.extend(data.y.flatten().numpy())
+        #             else:
+        #                 predictions.extend(pred.cpu().detach().numpy())
+        #                 labels.extend(data.y.cpu().flatten().numpy())
+            
+        #     predictions = np.array(predictions)
+        #     labels = np.array(labels)
+            
 
 
         if self.config['optimizer'] == 'adam':
@@ -128,6 +219,9 @@ class PredictorTrainer(object):
 
         n_iter = 0
         valid_n_iter = 0
+        patience = 10
+        counter = 0
+        early_stop = False
         best_valid_loss = np.inf
         best_valid_rmse = np.inf
         best_valid_r2 = -np.inf
@@ -162,16 +256,28 @@ class PredictorTrainer(object):
             if epoch_counter % self.config['eval_every_n_epochs'] == 0:
                 valid_loss, valid_rmse, valid_r2 = self._evaluate(predictor, valid_loader)
                 self.writer.add_scalar('valid_loss', valid_loss, global_step=valid_n_iter)
-                self.writer.add_scalar('valid_rmse', valid_rmse, global_step=valid_n_iter)
+                for task_name in valid_rmse:
+                    self.writer.add_scalar(f'valid_rmse/{task_name}', valid_rmse[task_name], global_step=valid_n_iter)
+                    self.writer.add_scalar(f'valid_r2/{task_name}', valid_r2[task_name], global_step=valid_n_iter)
+
                 valid_n_iter += 1
                 # print(f'epoch: {epoch_counter}, valid loss: {valid_loss}, valid rmse: {valid_rmse}, valid R2: {valid_r2}')
-
-                if valid_loss < best_valid_loss:
-                    best_valid_loss = valid_loss
-                    best_valid_rmse = valid_rmse
-                    best_valid_r2 = valid_r2
-                    torch.save(predictor.state_dict(), os.path.join(model_checkpoints_folder, 'best_model.pth'))
-                    print(f'model saved with valid loss: {valid_loss}, valid rmse: {valid_rmse}, valid R2: {valid_r2}')
+            avg_valid_rmse = np.mean(list(valid_rmse.values()))
+            avg_valid_r2 = np.mean(list(valid_r2.values()))
+            if valid_loss < best_valid_loss - 1e-4:
+                best_valid_loss = valid_loss
+                best_valid_rmse = valid_rmse
+                best_valid_r2 = valid_r2
+                torch.save(predictor.state_dict(), os.path.join(model_checkpoints_folder, 'best_model.pth'))
+                print(f'model saved with valid loss: {valid_loss:.4f}, avg RMSE: {avg_valid_rmse:.4f}, avg R2: {avg_valid_r2:.4f}')
+                counter = 0
+            else:
+                counter += 1
+                print(f"[Epoch {epoch_counter}] no improvement in valid loss for {counter} epoch(s).")
+                if counter >= patience and epoch_counter >= 80:
+                    print(f"Early stopping at epoch {epoch_counter}. Best valid loss: {best_valid_loss:.4f}")
+                    early_stop = True
+                    break
                 
         self._test(predictor, test_loader)
 
@@ -188,22 +294,34 @@ class PredictorTrainer(object):
 
                 data = data.to(self.device)
                 pred = model(data)
+                label = data.y.view(pred.shape).to(torch.float32)
                 loss = self._step(model, data)
                 total_loss += loss.item() * data.y.size(0)
                 total_num += data.y.size(0)
 
                 if self.device == 'cpu':
-                    predictions.extend(pred.detach().numpy())
-                    labels.extend(data.y.flatten().numpy())
+                    predictions.append(pred.detach().numpy())
+                    # labels.extend(data.y.flatten().numpy())
+                    # labels.append(data.y.cpu().numpy())
+                    labels.append(label.cpu().numpy()) 
                 else:
-                    predictions.extend(pred.cpu().detach().numpy())
-                    labels.extend(data.y.cpu().flatten().numpy())
+                    predictions.append(pred.cpu().detach().numpy())
+                    # labels.extend(data.y.cpu().flatten().numpy())
+                    # labels.append(data.y.cpu().numpy())
+                    labels.append(label.cpu().numpy())
         
-        predictions = np.array(predictions)
-        labels = np.array(labels)
+        predictions = np.concatenate(predictions, axis=0)  # shape: (total_samples, num_tasks)
+        labels = np.concatenate(labels, axis=0)            # shape: (total_samples, num_tasks)
 
-        rmse = mean_squared_error(labels, predictions) ** 0.5
-        r2 = r2_score(labels, predictions)
+        if predictions.ndim == 1 or labels.ndim == 1:
+            predictions = predictions.reshape(-1, 1)
+            labels = labels.reshape(-1, 1)
+        assert predictions.shape == labels.shape
+        assert predictions.shape[1] == len(self.task_names)
+        rmse = {name: mean_squared_error(labels[:, i], predictions[:, i]) ** 0.5
+                    for i, name in enumerate(self.task_names)}
+        r2 = {name: r2_score(labels[:, i], predictions[:, i])
+                for i, name in enumerate(self.task_names)} 
 
 
         return total_loss / total_num, rmse, r2
@@ -232,27 +350,38 @@ class PredictorTrainer(object):
                 num_data += data.y.size(0)
 
                 if self.device == 'cpu':
-                    predictions.extend(pred.detach().numpy())
-                    labels.extend(data.y.flatten().numpy())
+                    predictions.append(pred.detach().numpy())
+                    # labels.extend(data.y.flatten().numpy())
+                    # labels.append(data.y.cpu().numpy()) 
+                    labels.append(label.cpu().numpy())
                 else:
-                    predictions.extend(pred.cpu().detach().numpy())
-                    labels.extend(data.y.cpu().flatten().numpy())
+                    predictions.append(pred.cpu().detach().numpy())
+                    # labels.extend(data.y.cpu().flatten().numpy())
+                    # labels.append(data.y.cpu().numpy())
+                    labels.append(label.cpu().numpy())
         
-        predictions = np.array(predictions)
-        labels = np.array(labels)
+        predictions = np.concatenate(predictions, axis=0)  # shape: (total_samples, num_tasks)
+        labels = np.concatenate(labels, axis=0)            # shape: (total_samples, num_tasks)
 
-        self.rmse = mean_squared_error(labels, predictions) ** 0.5
-        self.r2 = r2_score(labels, predictions)
+        if predictions.ndim == 1 or labels.ndim == 1:
+            predictions = predictions.reshape(-1, 1)
+            labels = labels.reshape(-1, 1)
+        assert predictions.shape == labels.shape
+        assert predictions.shape[1] == len(self.task_names)
+        self.rmse = {name: mean_squared_error(labels[:, i], predictions[:, i]) ** 0.5
+                    for i, name in enumerate(self.task_names)}
+        self.r2 = {name: r2_score(labels[:, i], predictions[:, i])
+                for i, name in enumerate(self.task_names)} 
 
         print('Test loss:', test_loss / num_data, 'Test RMSE:', self.rmse, 'Test R2:', self.r2)
 
     def _load_pre_trained_weights(self, model):
         try:
-            checkpoints_folder = os.path.join('./ckpt/clr', self.config['fine_tune_from'], 'checkpoints')
-            CLRmodel = torch.load(os.path.join(checkpoints_folder, 'CLR_model.pth'), map_location=self.device)
+            checkpoints_folder = os.path.join(self.config['finetune_from'], 'checkpoints')
+            stat_dict = torch.load(os.path.join(checkpoints_folder, 'best_model.pth'), map_location=self.device)
             # model.load_state_dict(state_dict)
-            pretrained_model = CLRmodel.graphmodel.state_dict()
-            model.load_state_dict(pretrained_model, strict=False)
+            # pretrained_model = CLRmodel.graphmodel.state_dict()
+            model.load_state_dict(stat_dict)
             print("Loaded pre-trained model with success.")
         except FileNotFoundError:
             print("Pre-trained weights not found. Training from scratch.")
@@ -270,12 +399,13 @@ def set_random(seed):
     torch.backends.cudnn.benchmark = False     
 
 def main(config):
-     dataset = PolyGNNLoaderWrapper(batch_size = config['batch_size'], **config['dataset'])
+    dataset = PolyGNNLoaderWrapper(batch_size = config['batch_size'], **config['dataset'])
+    # train_data = PolyDataset(config['train_data'], config['targets'])
 
-     trainer = PredictorTrainer(dataset, config)
-     trainer.train()
+    trainer = PredictorTrainer(dataset, config)
+    trainer.train()
 
-     return trainer.rmse, trainer.r2
+    return trainer.rmse, trainer.r2
 
 if __name__ == "__main__":
 
@@ -289,10 +419,20 @@ if __name__ == "__main__":
     print(config)
 
     results_list = []
+    config['dataset']['targets'] = target_list
+    rmse_dict, r2_dict = main(config)  # unpack
+
     for target in target_list:
-        config['dataset']['targets'] = target
-        result = main(config)
-        results_list.append([config['pretrained_model'], target, result])
+        results_list.append([
+            config['pretrained_model'],
+            target,
+            rmse_dict[target],
+            r2_dict[target]
+        ])
+    # for target in target_list:
+    #     config['dataset']['targets'] = target
+    #     result = main(config)
+    #     results_list.append([config['pretrained_model'], target, result])
     
     os.makedirs('experiments/predict', exist_ok = True)
     df = pd.DataFrame(results_list)

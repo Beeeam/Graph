@@ -4,10 +4,11 @@ import h5py
 import math
 import pickle
 import numpy as np
+import selfies as sf
 from tqdm import tqdm
-from collections import defaultdict
+from collections import defaultdict, Counter
 from typing import List, Set, Dict
-
+from joblib import Parallel, delayed
 from rdkit import Chem
 from rdkit.Chem.rdchem import BondType as BT
 
@@ -77,13 +78,16 @@ def calculate_ECFP(mol, radius=2, fpSize=2048):
     fingerprint = generator.GetFingerprint(mol)
     return list(fingerprint)
 
-def compute_mmd(mu, log_var):
-    def compute_kernel(z1, z2, log_var):
+def compute_mmd(mu, log_var, sigma=None):
+    def compute_kernel(z1, z2, sigma):
         N, D = z1.size()
         z1 = z1.unsqueeze(1)
         z2 = z2.unsqueeze(0)
         assert z1.shape[-1] == z2.shape[-1], f"Dimension mismatch: {z1.shape} vs {z2.shape}"
-        sigma = 2. * torch.exp(log_var).mean(dim=-1, keepdim=True)
+        if sigma is None:
+            pairwise_dist = torch.cdist(z1.squeeze(1), z2.squeeze(0), p=2) ** 2
+            sigma = torch.median(pairwise_dist.flatten()) 
+            sigma = sigma / (N * D)
         # sigma = sigma.expand(N, D) 
         # print(sigma.shape)
         # print(z1.shape)
@@ -93,14 +97,15 @@ def compute_mmd(mu, log_var):
     z1 = mu + torch.exp(log_var / 2) * torch.randn_like(log_var)
     z2 = torch.randn_like(z1)
 
-    prior_z_kernel = compute_kernel(z2, z2, torch.zeros_like(log_var))
-    z_kernel = compute_kernel(z1, z1, log_var)
-    priorz_z_kernel = compute_kernel(z2, z1, log_var)
+    prior_z_kernel = compute_kernel(z2, z2, sigma)
+    z_kernel = compute_kernel(z1, z1, sigma)
+    priorz_z_kernel = compute_kernel(z2, z1, sigma)
 
     mmd = prior_z_kernel.mean() + z_kernel.mean() - 2 * priorz_z_kernel.mean()
     return mmd
 
-def mask_predict_vae_loss(recon_output, pad_token_id, target, mu, log_var, mask_pos, free_bits = 0.1):
+
+def mask_predict_vae_loss(recon_output, pad_token_id, target, mu, log_var, mask_pos, free_bits = 0.1, sigma=None):
     loss = F.cross_entropy(recon_output.reshape(-1, recon_output.size(-1)), 
                             target.reshape(-1), 
                             ignore_index=pad_token_id,
@@ -113,8 +118,27 @@ def mask_predict_vae_loss(recon_output, pad_token_id, target, mu, log_var, mask_
     # Apply free bits constraint
     penalty = F.softplus(-(kl_per_dim - free_bits))
     kl_loss = (kl_per_dim).sum(dim=-1).mean()
-    mmd_loss = compute_mmd(mu, log_var)
+    mmd_loss = compute_mmd(mu, log_var, sigma)
     return recon_loss, kl_loss, mmd_loss
+    
+def calculate_validity_loss(generated_smiles):
+    loss = 0
+    for smi in generated_smiles:
+        mol = Chem.MolFromSmiles(smi)
+        if mol is None:
+            loss += 1
+    return loss/len(generated_smiles)
+def cal_beta(n_iter, config):
+    step = n_iter
+    config = config['kl_anneal']
+    warmup_steps = config['kl_warmup']
+    if step < warmup_steps:
+        beta = 0
+    else:
+        beta = min(config['kl_end'], ((step - warmup_steps) // (config['kl_anneal_iter'] + 1) * config['kl_step']))
+    return beta
+
+
 
 def vae_loss(recon_output, pad_token_id, target, mu, log_var):
     criterion = nn.CrossEntropyLoss(ignore_index=pad_token_id)
@@ -158,7 +182,12 @@ class KLAnnealer:
             return self.kl_start + (self.kl_end - self.kl_start) * slop
         elif self.mode == 'cyclical':
             return self.kl_start + (self.kl_end - self.kl_start) * y
-
+def sanitize_smiles(smiles: str) -> str:
+    """Sanitizes and standardizes a SMILES string using RDKit."""
+    mol = Chem.MolFromSmiles(smiles)
+    if mol:
+        return Chem.MolToSmiles(mol)  # Canonical SMILES
+    return None
     
 class SpecialTokens:
     bos = '<bos>'
@@ -175,7 +204,7 @@ class SMILESRegex:
         r"(\%\([0-9]{3}\)|\[[^\]]+]|Br?|Cl?|S|B|C|N|O|P|F|I|b|c|n|o|s|p|\(|\)|\.|=|#|-|\+|\\|\/|:|~|@|\?|>|\*|\$|\%[0-9]{2}|[0-9]|H|\[|\])"
     )
 
-class SMILESVocab:
+class SELFIESVocab:
     def __init__(self, tokens: Set[str], special_tokens: SpecialTokens = SpecialTokens):
         
         for st in special_tokens.all():
@@ -193,14 +222,39 @@ class SMILESVocab:
     @classmethod
     def from_smiles_list(cls, smiles_list: List[str], special_tokens: SpecialTokens = SpecialTokens):
         tokens = set()
-        for smi in smiles_list:
-            tokens.update(cls.tokenize_smiles(smi))
+        # for smi in smiles_list:
+        #     sanitized = sanitize_smiles(smi)
+        #     if sanitized is None:
+        #         print(f"Invalid SMILES: {smi}")
+        #         return None  # Return None for invalid molecules
+        #     try:
+        #         selfies = sf.encoder(sanitized)
+        #     except sf.EncoderError as e:
+        #         print(f"SELFIES Encoding Error: {e}")
+        #         return None
+        selfies = sf.encoder(smiles_list)
+        tokens.update(cls.tokenize_selfies(selfies))
         return cls(tokens, special_tokens)
 
     @staticmethod
-    def tokenize_smiles(smiles: str) -> List[str]:
+    def tokenize_selfies(smiles: str) -> List[str]:
+        # # smi = sanitize_smiles(smiles)
+        # sanitized = sanitize_smiles(smiles)
+        # if sanitized is None:
+        #     print(f"Invalid SMILES: {smiles}")
+        #     return None  # Return None for invalid molecules
 
-        return SMILESRegex.pattern.findall(smiles)
+        # try:
+        #     selfies = sf.encoder(sanitized)
+        #     return list(sf.split_selfies(selfies))
+        # except sf.EncoderError as e:
+        #     print(f"SELFIES Encoding Error: {e}")
+        #     return None
+        if sf.is_valid_selfies(smiles):
+            selfies = smiles
+        else:
+            selfies = sf.encoder(smiles)
+        return list(sf.split_selfies(selfies))
 
     @property
     def bos_token(self) -> str:
@@ -259,7 +313,23 @@ class SMILESVocab:
         max_length: int = None,
         padding: bool = False
     ) -> List[int]:
-        tokens = self.tokenize_smiles(smiles)
+        # smi = sanitize_smiles(smiles)
+        # sanitized = sanitize_smiles(smi)
+        # if sanitized is None:
+        #     print(f"Invalid SMILES: {smi}")
+        #     return None  # Return None for invalid molecules
+
+        # try:
+        #     selfies = sf.encoder(sanitized)
+            
+        # except sf.EncoderError as e:
+        #     print(f"SELFIES Encoding Error: {e}")
+        #     return None
+        if sf.is_valid_selfies(smiles):
+            selfies = smiles
+        else:
+            selfies = sf.encoder(smiles)
+        tokens = self.tokenize_selfies(selfies)
         indices = [self.token_to_idx(t) for t in tokens if t in self.token2idx] 
         
         if add_bos:
@@ -324,7 +394,10 @@ class SMILESVocab:
         indices_list: List[List[int]], 
         **kwargs
     ) -> List[str]:
-        return [self.decode(indices, **kwargs) for indices in indices_list]
+        # return [self.decode(indices, **kwargs) for indices in indices_list]
+        return Parallel(n_jobs=-1)(
+        delayed(self.decode)(indices, **kwargs) for indices in indices_list
+    )
 
     def to_onehot(self, indices: List[int]) -> torch.Tensor:
         vec = torch.zeros(len(indices), len(self), dtype=torch.float)
@@ -365,18 +438,20 @@ class SMILESVocab:
             for line in f:
                 t, _ = line.strip().split('\t')
                 tokens.append(t)
-        # 过滤特殊符号
+        
         chem_tokens = [t for t in tokens if t not in special_tokens.all()]
         return cls(set(chem_tokens), special_tokens)
 
-def build_vocab_large(data_path, chunk_size=1e6, save_path='pubchem_vocab.pkl'):
+def build_vocab_large(data_path, chunk_size=1e6, save_path='zp_vocab.pkl'):
     token_counter = defaultdict(int)
     
     with open(data_path, 'r') as f:
         for line in tqdm(f, desc="Building Vocab"):
             smi = line.strip()
             # print(smi)
-            tokens = SMILESVocab.tokenize_smiles(smi)
+            tokens = SELFIESVocab.tokenize_selfies(smi)
+            if tokens is None:
+                tokens = []
             for t in tokens:
                 token_counter[t] += 1
                 
@@ -392,7 +467,7 @@ def build_vocab_large(data_path, chunk_size=1e6, save_path='pubchem_vocab.pkl'):
                         break
                 token_counter = dict(freqs[:i])
     
-    vocab = SMILESVocab(set(token_counter.keys()))
+    vocab = SELFIESVocab(set(token_counter.keys()))
     with open(save_path, "wb") as f:
         pickle.dump(vocab, f)
     return vocab
